@@ -161,6 +161,5 @@ marker) runs regardless — see the pytest summary for the current count.
 
 ## Citation
 
-> Tamer A. Mansour. *A Context-Aware Computational Pipeline for High-Precision
-> Remapping of Genotyping Arrays: Updating the Equine80select Manifest to
-> EquCab3.* https://github.com/drtamermansour/InfiniTier, 2025.
+> Tamer A. Mansour. *InfiniTier: A Context-Aware Computational Pipeline for High-Precision
+> Remapping of Infinium Genotyping Arrays. https://github.com/drtamermansour/InfiniTier, 2025.
