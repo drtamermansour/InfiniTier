@@ -781,7 +781,7 @@ def test_integration_runs_without_error(tmp_path, manifest_path, remapped_csv, a
             "--assembly",   assembly_label,
             "--output-dir", str(tmp_path),
         ],
-        cwd="/home/tahmed/Equine80select_remapper",
+        cwd="/home/tahmed/InfiniTier",
         capture_output=True,
         text=True,
     )
@@ -805,7 +805,7 @@ def test_integration_correct_count(tmp_path, manifest_path, remapped_csv, assemb
             "--assembly",   assembly_label,
             "--output-dir", str(tmp_path),
         ],
-        cwd="/home/tahmed/Equine80select_remapper",
+        cwd="/home/tahmed/InfiniTier",
         capture_output=True,
     )
     tsv_files = [f for f in os.listdir(tmp_path)
@@ -851,7 +851,7 @@ def test_integration_baseline_produces_diff_file(tmp_path, manifest_path, remapp
             "--assembly",   assembly_label,
             "--output-dir", str(run1),
         ],
-        cwd="/home/tahmed/Equine80select_remapper",
+        cwd="/home/tahmed/InfiniTier",
         capture_output=True,
         check=True,
     )
@@ -870,7 +870,7 @@ def test_integration_baseline_produces_diff_file(tmp_path, manifest_path, remapp
             "--output-dir", str(run2),
             "--baseline",   baseline_tsv,
         ],
-        cwd="/home/tahmed/Equine80select_remapper",
+        cwd="/home/tahmed/InfiniTier",
         capture_output=True,
         check=True,
     )

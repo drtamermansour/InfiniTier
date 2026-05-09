@@ -1,7 +1,7 @@
 srun --account=publicgrp -p low -t 01-0:00:00 -c 64 -n 1 -N 1 --mem=50g --pty bash
 
-git clone git@github.com:drtamermansour/Equine80select_remapper.git
-cd Equine80select_remapper
+git clone git@github.com:drtamermansour/InfiniTier.git
+cd InfiniTier
 work_dir=$(pwd)
 
 
