@@ -171,7 +171,7 @@ python scripts/benchmark_cigar_vs_probe.py \
     --output-dir results_CanineHTS24_to_canFam3_noFilters/benchmark/
 
 #############################################
-## susScr11
+## C) susScr11
 # 1. Get the input manifest
 ## PorcineSNP60 v3.0 BeadChip
 ## https://support.illumina.com/downloads/porcinesnp60-v3_product_files.html
