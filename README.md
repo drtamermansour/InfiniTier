@@ -1,4 +1,4 @@
-# Array Manifest Remapper
+# InfiniTier
 
 A pipeline for **moving genotyping array markers from one reference genome assembly to another**.
 
@@ -40,8 +40,8 @@ You need [Conda](https://docs.conda.io) (or Mamba) and a reference genome
 FASTA file.
 
 ```bash
-git clone git@github.com:drtamermansour/Equine80select_remapper.git
-cd Equine80select_remapper
+git clone git@github.com:drtamermansour/InfiniTier.git
+cd InfiniTier
 bash install.sh        # creates a conda environment called 'remap'
 conda activate remap
 ```
@@ -163,4 +163,4 @@ marker) runs regardless — see the pytest summary for the current count.
 
 > Tamer A. Mansour. *A Context-Aware Computational Pipeline for High-Precision
 > Remapping of Genotyping Arrays: Updating the Equine80select Manifest to
-> EquCab3.* https://github.com/drtamermansour/Equine80select_remapper, 2025.
+> EquCab3.* https://github.com/drtamermansour/InfiniTier, 2025.
