@@ -1,146 +1,166 @@
 # Array Manifest Remapper
 
-A computational pipeline for remapping Illumina genotyping array manifests between reference genome assemblies. It uses a **context-aware dual-alignment strategy** — aligning both the short physical probe (50 bp) and the longer `TopGenomicSeq` context sequence — to ensure high-fidelity coordinate conversion, correct strand assignment, and precise Ref/Alt allele determination consistent with VCF standards.
+A pipeline for **moving genotyping array markers from one reference genome assembly to another**.
 
-Originally developed to remap the **Equine80select** array from EquCab2 to EquCab3.
+When a genome assembly is updated, the genomic coordinates of every marker on
+an Illumina genotyping array can shift — sometimes by a few base pairs, sometimes
+by megabases. Naively lifting coordinates with a chain file misses markers and
+loses information about strand, alleles, and confidence. This tool re-aligns
+each marker's actual probe sequence and surrounding context to the new
+reference and produces a high-confidence map suitable for downstream
+genotype-calling, GWAS, and imputation pipelines (PLINK2, Beagle, etc.).
 
-## Prerequisites
+> **Originally built for** the Equine80select array (~82,000 markers) moving
+> from EquCab2 to EquCab3 reference assemblies, but works on any Illumina
+> Infinium manifest paired with any reference FASTA.
 
-- **Conda** or **Mamba** package manager
-- **Reference genome FASTA** for the target assembly (indexed with `samtools faidx`)
+---
+
+## What you get
+
+For every marker in the input manifest, the pipeline produces:
+
+- a **chromosome and base-pair position** on the target reference,
+- a **strand** assignment (which DNA strand the alleles live on),
+- **Ref / Alt alleles** in VCF-standard orientation,
+- a **confidence label** so downstream users can filter low-quality remappings,
+- and a per-marker trace showing exactly which quality-control rule (if any)
+  removed it from the final output.
+
+The headline output is a tab-separated file —
+`{prefix}_allele_map_{assembly}.tsv` — a per-marker crosswalk between the
+manifest's original SNP alleles and the new-assembly genomic alleles, plus a
+PLINK BIM / final VCF you can feed directly to PLINK2 or Beagle.
+
+---
 
 ## Setup
+
+You need [Conda](https://docs.conda.io) (or Mamba) and a reference genome
+FASTA file.
 
 ```bash
 git clone git@github.com:drtamermansour/Equine80select_remapper.git
 cd Equine80select_remapper
-
-# Create the 'remap' conda environment with all dependencies
-bash install.sh
+bash install.sh        # creates a conda environment called 'remap'
 conda activate remap
 ```
 
-## Running the Pipeline
+The `install.sh` script installs `minimap2`, `samtools`, `bcftools`, `pysam`,
+and `pandas` — everything the pipeline needs.
+
+---
+
+## Quick start
 
 ```bash
 bash run_pipeline.sh \
-    -i backup_original/Equine80select_24_20067593_B1.csv \
-    -r equCab3/equCab3_genome.fa \
+    -i your_manifest.csv \
+    -r reference_genome.fa \
     -a equCab3 \
     -o results/
 ```
 
-### All Options
+That's it. Three required inputs: the **manifest** (`-i`), the **reference
+FASTA** (`-r`), and an **assembly label** (`-a`) used to name the output
+columns. Results land in `results/`:
 
-| Flag | Default | Description |
+```
+results/
+├── remapping/                                      ← step 1: realignment
+│   ├── {prefix}_remapped_{assembly}.csv            full marker table with quality columns
+│   ├── remapping_Report.txt                        per-marker decision summary
+│   └── (sidecar CSVs: unresolved / scaffold / NM-position triples — see docs/output_formats.md)
+└── qc/                                             ← step 2: quality filtering
+    ├── {prefix}_allele_map_{assembly}.tsv          ★ main output — allele crosswalk
+    ├── {prefix}_remapped_{assembly}.bim            PLINK BIM
+    ├── {prefix}_remapped_{assembly}.vcf            final filtered VCF
+    ├── {prefix}_remapped_{assembly}_traced.csv     per-marker filter trace
+    ├── QC_Report.txt                               per-stage filter counts
+    └── diagnostics/                                MAPQ histograms
+```
+
+Every marker is labelled by **anchor** — `topseq_n_probe` (both TopSeq and
+probe aligned), `topseq_only` (only TopSeq aligned), `probe_only` (only
+probe aligned), or `N/A` (neither) — so downstream filters can trade off
+coverage vs confidence.
+
+For HPC clusters: `bash submit_slurm.sh -i ... -r ... -a ... -o results/ -t 64`.
+
+---
+
+## Common options
+
+The most useful flags. See [docs/cli_reference.md](docs/cli_reference.md) for everything.
+
+| Flag | Default | What it does |
 |---|---|---|
-| `-i / --manifest` | *(required)* | Path to the Illumina manifest CSV |
-| `-r / --reference` | *(required)* | Path to the target reference genome FASTA |
-| `-a / --assembly` | derived from FASTA filename | Assembly name used to label outputs |
-| `-o / --output-dir` | `./output` | Output directory |
-| `-t / --threads` | `4` | Threads for minimap2 |
-| `--mapq-topseq` | `30` | Minimum MAPQ for TopGenomicSeq alignments |
-| `--mapq-probe` | `0` (disabled) | Minimum MAPQ for probe alignments |
-| `--keep-temp` | off | Retain intermediate FASTA/SAM files |
-| `--resume` | off | Skip step 2 if the remapped CSV already exists (useful after a step 3 failure) |
+| `-t / --threads` | `4` | Threads for minimap2 (use more on HPC) |
+| `--preset` | `default` (implicit) | One-knob strictness: `strict` / `default` / `permissive`. Tunes the strictness + threshold + include/exclude flags as a bundle; individual flags override. Omitting the flag is equivalent to `--preset default` — the defaults shown throughout this README are the `default` preset's values. |
+| `--min-anchor` | `topseq` | How permissive to be about which markers count: `dual` (strictest — `topseq_n_probe` only), `topseq` (also `topseq_only`), `probe` (most permissive — also `probe_only`) |
+| `--include-indels` | off | By default, indel markers are dropped from the final outputs. Pass this to keep them. |
+| `--include-ambiguous-snps` | off | By default, A/T and C/G SNPs are dropped (their alleles can't tell strand apart). Pass this to keep them. |
+| `--resume` | off | Skip realignment if it has already been done — useful when iterating on filter settings. |
 
-For HPC clusters, use the SLURM wrapper:
+---
+
+## Documentation
+
+Topic-focused guides for users and developers:
+
+| Page | What's in it |
+|---|---|
+| [docs/algorithm_overview.md](docs/algorithm_overview.md) | How the pipeline decides where each marker goes |
+| [docs/decision_tree_simple.md](docs/decision_tree_simple.md) | The full per-marker decision flow as a flowchart |
+| [docs/cli_reference.md](docs/cli_reference.md) | Every CLI flag for `run_pipeline.sh`, `remap_manifest.py`, `qc_filter.py` |
+| [docs/qc_filters.md](docs/qc_filters.md) | The 11-stage quality-control cascade explained |
+| [docs/output_formats.md](docs/output_formats.md) | All output files and their columns |
+| [docs/benchmarking.md](docs/benchmarking.md) | How to measure remapping accuracy against a known-good manifest |
+| [docs/benchmarking_vs_liftover.md](docs/benchmarking_vs_liftover.md) | Head-to-head benchmark vs. UCSC liftOver and CrossMap |
+| [docs/scaffold_filtering.md](docs/scaffold_filtering.md) | Pre-pipeline step to clean unplaced-scaffold haplotypes from the reference |
+
+Deeper dives into specific concepts:
+
+| Page | What's in it |
+|---|---|
+| [docs/strand_explained.md](docs/strand_explained.md) | The three "strand" columns in an Illumina manifest and what they each mean |
+| [docs/CIGAR_walk.md](docs/CIGAR_walk.md) | How a CIGAR string is walked to derive a coordinate |
+| [docs/NM_comparison.md](docs/NM_comparison.md) | How alignment edit-distance (`NM`) is used to choose Ref vs Alt for indels |
+| [docs/why_we_right.md](docs/why_we_right.md) | Worked examples where the pipeline correctly placed markers that the manifest had wrong |
+| [docs/cant_remap.md](docs/cant_remap.md) | Categories of marker the pipeline cannot remap, and why |
+| [docs/scaffold_haplotype_thresholds.md](docs/scaffold_haplotype_thresholds.md) | Recommended thresholds for the alt-haplotype scaffold filter |
+
+---
+
+## Running the tests
+
+Unit tests only (no pipeline data needed):
 
 ```bash
-bash submit_slurm.sh -i <manifest.csv> -r <reference.fa> -a <assembly> -o results/ -t 64
+conda activate remap
+pytest tests/ -v -k "not integration"
 ```
 
-## Outputs
-
-All outputs are written to `--output-dir`:
-
-| File | Description |
-|---|---|
-| `{prefix}_remapped_{assembly}.csv` | Full remapped manifest with new coordinates and MAPQ scores |
-| `matchingSNPs_binary_consistantMapping.{assembly}_map` | **Main output.** Final high-quality marker map |
-| `{prefix}_remapped_{assembly}.bim` | PLINK BIM format (CHR, SNP, 0, POS, REF, ALT) |
-| `_matchingSNPs_binary_consistantMapping.vcf` | Final filtered VCF |
-| `_matchingSNPs.vcf` | VCF after design-conflict filter |
-| `_matchingSNPs_binary.vcf` | VCF after polymorphic-site filter |
-| `allele_usage_decision.txt` | Per-SNP orientation decision (as_is / complement) |
-| `QC_Report.txt` | Marker counts at each filter stage |
-| `remap_assessment/` | MAPQ histograms and known-assembly benchmarks |
-
-### Map File Format
-
-`matchingSNPs_binary_consistantMapping.{assembly}_map` — tab-delimited, no header:
-
-| Column | Description |
-|---|---|
-| chr | Chromosome on the new assembly |
-| pos | Base-pair position |
-| snpID | Marker name |
-| SNP_alleles | Manifest alleles (e.g. `A,G`) |
-| genomic_alleles | + strand alleles matching SNP_alleles order |
-| SNP_ref_allele | The SNP allele corresponding to the reference |
-| genomic_ref_allele | The reference allele on the + strand |
-| allele_usage_decision | `as_is` or `complement` |
-
-## QC Filter Cascade
-
-Markers are removed progressively; `QC_Report.txt` records counts at each stage:
-
-1. **Unmapped** — `Strand == N/A` (failed TopGenomicSeq alignment)
-2. **MAPQ** — `MAPQ_TopGenomicSeq < --mapq-topseq`
-3. **Design conflict** — remapped Ref allele does not match genome Ref at that position
-4. **Polymorphic sites** — position shared by multiple markers with different Ref/Alt assignments
-5. **Consistency** — probe + TopGenomicSeq alignment count ≠ 3
-
-For Equine80select → EquCab3 (default settings):
-```
-Input markers:                81,974
-After unmapped filter:        81,945   (-29)
-After MAPQ filter (>=30):     ~81,9xx
-After design conflict:        81,672   (-273)
-After polymorphic filter:     81,660   (-12)
-After consistency filter:     80,197   (-1,463)
-```
-
-## Optional: Molly Cross-Validation
-
-For Equine80select, results can be cross-validated against the MNEc670k Molly remapping:
+Full suite including the three benchmark-integration tests (require a real
+pipeline output directory — typically the `results/` folder from an earlier
+run — plus the source Illumina manifest that was fed to the pipeline):
 
 ```bash
-bash scripts/compare_molly.sh \
-    -b results/Equine80select_remapped_equCab3.bim \
-    -m /path/to/MNEc670k.unique_remap.FINAL.csv \
-    -o results/molly_comparison/
+pytest tests/ -v \
+    --results-dir /path/to/results \
+    --manifest    /path/to/source_manifest.csv
 ```
 
-## Pipeline Methodology
+Without these flags, the three integration tests in
+`tests/test_benchmark_compare.py` fail fast with a clear
+"Integration tests require --results-dir" / "require --manifest" message;
+the unit-test portion (everything not under the benchmark-integration
+marker) runs regardless — see the pytest summary for the current count.
 
-### Dual-Alignment Strategy
-
-For each marker, two sequences are aligned to the reference with `minimap2 -ax sr`:
-
-1. **TopGenomicSeq** — the full genomic context `PREFIX[AlleleA/AlleleB]SUFFIX` is split into two candidates (one per allele). The candidate with lower edit distance (NM tag) is the reference allele. This alignment determines chromosome, strand, and Ref/Alt.
-
-2. **Probe** (`AlleleA_ProbeSeq`, 50 bp) — if the probe aligns to the same chromosome and overlaps the TopGenomicSeq window on the same strand, its 3' end position is used for high-precision coordinate calculation. Otherwise, the coordinate falls back to parsing the TopGenomicSeq CIGAR string.
-
-### Infinium Chemistry Handling
-
-- **Infinium II**: variant is the base immediately after the probe 3' end
-- **Infinium I**: variant is the last base of the probe
-- On the minus strand, the probe's physical 3' end maps to the alignment start position
-
-### Allele Usage Decision
-
-Each marker gets an `as_is` or `complement` decision, controlling how the manifest's SNP alleles (`[A/B]` column) map to forward-strand genomic alleles. The decision is determined by three binary conditions (XOR logic):
-- `IlmnStrand != SourceStrand`
-- `SourceSeq != TopGenomicSeq`
-- `Strand_{assembly} == '-'`
+---
 
 ## Citation
 
-If you use this pipeline in your research, please cite:
-
-> Tamer A. Mansour. "A Context-Aware Computational Pipeline for High-Precision Remapping of Genotyping Arrays: Updating the Equine80select Manifest to EquCab3." https://github.com/drtamermansour/Equine80select_remapper, 2025.
-
-## License
-
-MIT License — see [LICENSE](LICENSE).
+> Tamer A. Mansour. *A Context-Aware Computational Pipeline for High-Precision
+> Remapping of Genotyping Arrays: Updating the Equine80select Manifest to
+> EquCab3.* https://github.com/drtamermansour/Equine80select_remapper, 2025.

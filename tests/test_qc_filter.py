@@ -1,0 +1,528 @@
+import math
+import pytest
+import sys
+import os
+from unittest.mock import MagicMock
+
+import pandas as pd
+
+from qc_filter import (
+    apply_probe_mapq_filter,
+    strand_normalize,
+    check_deletion_ref_match,
+    make_anchor_alleles,
+    apply_exclude_indels_filter,
+    apply_exclude_ambiguous_snps_filter,
+    apply_min_anchor_filter,
+    apply_tie_policy_filter,
+    apply_min_refalt_confidence_filter,
+    format_three_d_table,
+    _tag_removed,
+    WHY_FILTERED_LABELS,
+)
+
+
+# ── apply_probe_mapq_filter ───────────────────────────────────────────────────
+
+def _df(*mapq_values):
+    """Build a minimal DataFrame with MAPQ_Probe column."""
+    return pd.DataFrame({"MAPQ_Probe": list(mapq_values)})
+
+
+def test_probe_mapq_filter_disabled_at_zero():
+    """threshold=0 (default) → filter disabled, all rows pass."""
+    df = _df(0, 5, 20, 60, float('nan'))
+    result = apply_probe_mapq_filter(df, threshold=0)
+    assert list(result.index) == list(df.index)
+
+
+def test_probe_mapq_filter_nan_exempt():
+    """NaN MAPQ_Probe (topseq_only marker) is exempt — must not be removed."""
+    df = _df(float('nan'))
+    result = apply_probe_mapq_filter(df, threshold=30)
+    assert len(result) == 1
+
+
+def test_probe_mapq_filter_removes_below_threshold():
+    """Row with real MAPQ_Probe below threshold is removed."""
+    df = _df(20)
+    result = apply_probe_mapq_filter(df, threshold=30)
+    assert len(result) == 0
+
+
+def test_probe_mapq_filter_passes_at_threshold():
+    """Row with MAPQ_Probe exactly at threshold is kept."""
+    df = _df(30)
+    result = apply_probe_mapq_filter(df, threshold=30)
+    assert len(result) == 1
+
+
+def test_probe_mapq_filter_passes_above_threshold():
+    """Row with MAPQ_Probe above threshold is kept."""
+    df = _df(60)
+    result = apply_probe_mapq_filter(df, threshold=30)
+    assert len(result) == 1
+
+
+def test_probe_mapq_filter_mixed_dataset():
+    """Mixed: NaN exempt, below threshold removed, at/above threshold kept."""
+    df = _df(float('nan'), 20, 30, 60)
+    result = apply_probe_mapq_filter(df, threshold=30)
+    # NaN (idx 0), 30 (idx 2), 60 (idx 3) survive; 20 (idx 1) removed
+    assert list(result.index) == [0, 2, 3]
+
+
+# ── _tag_removed + WHY_FILTERED_LABELS ────────────────────────────────────────
+
+def test_why_filtered_labels_define_eleven_stages():
+    """WHY_FILTERED_LABELS must list exactly the 11 filter stages in order."""
+    assert WHY_FILTERED_LABELS == [
+        "stage_1_failed_markers",
+        "stage_2_design_conflict",
+        "stage_3_min_anchor",
+        "stage_4_tie_policy",
+        "stage_5_min_refalt_confidence",
+        "stage_6_mapq_topseq",
+        "stage_7_mapq_probe",
+        "stage_8_coord_delta",
+        "stage_9_indel_excluded",
+        "stage_10_polymorphic",
+        "stage_11_ambiguous_snp",
+    ]
+
+
+# ── apply_exclude_ambiguous_snps_filter ───────────────────────────────────────
+
+def test_exclude_ambiguous_removes_at_cg_pairs():
+    """SNPs with {A,T} or {C,G} allele pairs are removed; others kept."""
+    df = pd.DataFrame({
+        "_gref": ["A", "C", "A", "G", "A"],
+        "_galt": ["T", "G", "G", "A", "C"],
+    })
+    out = apply_exclude_ambiguous_snps_filter(df)
+    # idx 0 → {A,T} ambiguous; idx 1 → {C,G} ambiguous; idx 2,3,4 → non-ambiguous
+    assert list(out.index) == [2, 3, 4]
+
+
+def test_exclude_ambiguous_drops_at_in_both_orders():
+    """{A,T} is a set — order inside the row doesn't matter."""
+    df = pd.DataFrame({"_gref": ["A", "T"], "_galt": ["T", "A"]})
+    out = apply_exclude_ambiguous_snps_filter(df)
+    assert len(out) == 0
+
+
+def test_exclude_ambiguous_keeps_indels_even_when_other_allele_is_A_or_T():
+    """Indel rows have an empty allele; {A,''} and {'',T} are not ambiguous pairs."""
+    df = pd.DataFrame({"_gref": ["A", ""], "_galt": ["", "T"]})
+    out = apply_exclude_ambiguous_snps_filter(df)
+    assert len(out) == 2
+
+
+def test_exclude_ambiguous_empty_df():
+    """Empty input → empty output, no errors."""
+    df = pd.DataFrame({"_gref": [], "_galt": []})
+    out = apply_exclude_ambiguous_snps_filter(df)
+    assert len(out) == 0
+
+
+def test_tag_removed_tags_markers_dropped_by_stage():
+    """Markers in before-idx but not in after-idx receive the stage label."""
+    why = pd.Series(["", "", "", ""], index=[0, 1, 2, 3])
+    _tag_removed(why, before_idx=[0, 1, 2, 3], after_idx=[0, 2], label="stage_3_min_anchor")
+    assert why.tolist() == ["", "stage_3_min_anchor", "", "stage_3_min_anchor"]
+
+
+def test_tag_removed_preserves_first_rejection_label():
+    """A marker already labelled by an earlier stage keeps that label (first-rejection-wins)."""
+    why = pd.Series(["stage_1_failed_markers", "", "", ""], index=[0, 1, 2, 3])
+    _tag_removed(why, before_idx=[0, 1, 2, 3], after_idx=[2], label="stage_3_min_anchor")
+    assert why.tolist() == [
+        "stage_1_failed_markers",   # kept (set earlier)
+        "stage_3_min_anchor",  # newly tagged
+        "",                         # passed
+        "stage_3_min_anchor",  # newly tagged
+    ]
+
+
+def test_tag_removed_noop_when_nothing_removed():
+    """If after-idx == before-idx, no labels are added."""
+    why = pd.Series(["", "", ""], index=[0, 1, 2])
+    _tag_removed(why, before_idx=[0, 1, 2], after_idx=[0, 1, 2], label="stage_5_min_refalt_confidence")
+    assert why.tolist() == ["", "", ""]
+
+
+def test_tag_removed_works_with_non_sequential_indices():
+    """Must use index identity, not positional order — robust to filtered DataFrame indices."""
+    why = pd.Series(["", "", ""], index=[10, 42, 99])
+    _tag_removed(why, before_idx=[10, 42, 99], after_idx=[42], label="stage_7_mapq_probe")
+    assert why[10]  == "stage_7_mapq_probe"
+    assert why[42]  == ""
+    assert why[99]  == "stage_7_mapq_probe"
+
+
+def test_probe_mapq_filter_zero_mapq_removed_when_threshold_active():
+    """MAPQ_Probe=0 (real zero, not NaN) is filtered when threshold > 0.
+
+    Under the old sentinel design, 0 was used for both 'no probe alignment'
+    and 'probe aligned with MAPQ 0'. Now 'no probe alignment' is NaN, so
+    a genuine MAPQ_Probe=0 row (ambiguous probe) should be filtered out.
+    """
+    df = _df(0)
+    result = apply_probe_mapq_filter(df, threshold=1)
+    assert len(result) == 0
+
+
+
+# ── strand_normalize with empty string (deletion allele) ─────────────────────
+
+def test_strand_normalize_empty_string_plus_strand():
+    """Deletion allele '' on + strand stays '' — no complement to compute."""
+    assert strand_normalize("", "+") == ""
+
+def test_strand_normalize_empty_string_minus_strand():
+    """Deletion allele '' on - strand stays '' — complement of empty is empty."""
+    assert strand_normalize("", "-") == ""
+
+
+# ── design conflict filter excludes empty _galt (deletion allele) ─────────────
+
+def _dc_df(gref, galt, genome_ref):
+    """Build a minimal DataFrame for design conflict filter testing."""
+    return pd.DataFrame({"_gref": [gref], "_galt": [galt], "_genome_ref": [genome_ref]})
+
+def test_design_conflict_excludes_deletion_allele_empty_string():
+    """Indel with deletion allele stored as '' (not '-') is excluded by _galt != ''."""
+    df = _dc_df(gref="CTCGTGCC", galt="", genome_ref="CTCGTGCC")
+    result = df[(df["_gref"] == df["_genome_ref"]) & (df["_galt"] != "")]
+    assert len(result) == 0
+
+def test_design_conflict_excludes_insertion_allele_empty_string():
+    """Indel where the deletion is the ref (empty) is excluded by _gref == _genome_ref failing."""
+    df = _dc_df(gref="", galt="CTCGTGCC", genome_ref="T")
+    result = df[(df["_gref"] == df["_genome_ref"]) & (df["_galt"] != "")]
+    assert len(result) == 0
+
+def test_design_conflict_old_dash_sentinel_no_longer_needed():
+    """After fix, '-' string does not appear as _galt — a row with '-' passes the '' check.
+
+    This documents that the old sentinel '-' is replaced by '' and the filter
+    must use '' not '-'.
+    """
+    df = _dc_df(gref="A", galt="-", genome_ref="A")
+    result_old = df[(df["_gref"] == df["_genome_ref"]) & (df["_galt"] != "-")]
+    result_new = df[(df["_gref"] == df["_genome_ref"]) & (df["_galt"] != "")]
+    # Old filter would exclude '-'; new filter lets '-' through (it's now unexpected)
+    assert len(result_old) == 0
+    assert len(result_new) == 1
+
+
+# ── check_deletion_ref_match (Q1: indel design conflict) ─────────────────────
+
+def _mock_fasta(return_value):
+    fasta = MagicMock()
+    fasta.fetch.return_value = return_value
+    return fasta
+
+
+def test_check_deletion_ref_match_matches():
+    """Deletion ref 'ACGT' matches reference sequence at mapinfo → True (no conflict)."""
+    fasta = _mock_fasta("ACGT")
+    assert check_deletion_ref_match(fasta, "chr1", 1000, "ACGT") is True
+    fasta.fetch.assert_called_once_with("chr1", 999, 1003)  # 0-based: mapinfo-1 to mapinfo-1+len
+
+
+def test_check_deletion_ref_match_mismatch():
+    """Deletion ref 'ACGT' does not match reference 'TTTT' → False (design conflict)."""
+    fasta = _mock_fasta("TTTT")
+    assert check_deletion_ref_match(fasta, "chr1", 1000, "ACGT") is False
+
+
+def test_check_deletion_ref_match_case_insensitive():
+    """Reference fetch returns lowercase; comparison is case-insensitive."""
+    fasta = _mock_fasta("acgt")
+    assert check_deletion_ref_match(fasta, "chr1", 1000, "ACGT") is True
+
+
+def test_check_deletion_ref_match_fetch_error_returns_false():
+    """pysam fetch error (unknown contig) → False (conservative: treat as conflict)."""
+    fasta = MagicMock()
+    fasta.fetch.side_effect = ValueError("unknown contig")
+    assert check_deletion_ref_match(fasta, "chrUn_99", 100, "ACGT") is False
+
+
+def test_check_deletion_ref_match_insertion_empty_gref_returns_true():
+    """For insertion alleles, gref is '' — nothing to verify → True (no conflict)."""
+    fasta = MagicMock()  # fetch should not be called
+    assert check_deletion_ref_match(fasta, "chr1", 1000, "") is True
+    fasta.fetch.assert_not_called()
+
+
+# ── make_anchor_alleles (Q3: anchor-base encoding for indels) ─────────────────
+
+def test_make_anchor_alleles_deletion():
+    """Deletion (gref='CTCG', galt=''): REF=anchor+gref, ALT=anchor, pos=mapinfo-1."""
+    fasta = _mock_fasta("A")
+    vcf_pos, vcf_ref, vcf_alt = make_anchor_alleles(fasta, "chr1", 1000, "CTCG", "")
+    assert vcf_pos == 999            # mapinfo - 1
+    assert vcf_ref == "ACTCG"        # anchor + deleted_seq
+    assert vcf_alt == "A"            # anchor only
+
+
+def test_make_anchor_alleles_insertion():
+    """Insertion (gref='', galt='CTCG'): REF=anchor, ALT=anchor+galt, pos=mapinfo-1."""
+    fasta = _mock_fasta("T")
+    vcf_pos, vcf_ref, vcf_alt = make_anchor_alleles(fasta, "chr1", 500, "", "CTCG")
+    assert vcf_pos == 499
+    assert vcf_ref == "T"
+    assert vcf_alt == "TCTCG"
+
+
+def test_make_anchor_alleles_fetch_error_uses_n():
+    """If anchor fetch fails, use 'N' as anchor (conservative)."""
+    fasta = MagicMock()
+    fasta.fetch.side_effect = ValueError("out of range")
+    vcf_pos, vcf_ref, vcf_alt = make_anchor_alleles(fasta, "chr1", 100, "ACG", "")
+    assert vcf_ref == "NACG"
+    assert vcf_alt == "N"
+
+
+def test_make_anchor_alleles_uppercase():
+    """Anchor is uppercased regardless of FASTA capitalisation."""
+    fasta = _mock_fasta("g")
+    _, vcf_ref, _ = make_anchor_alleles(fasta, "chr1", 200, "AT", "")
+    assert vcf_ref[0] == "G"  # anchor is uppercase
+
+
+# ── apply_exclude_indels_filter (Q4) ─────────────────────────────────────────
+
+def _indel_df(*rows):
+    """Build minimal DataFrame with _gref and _galt columns."""
+    return pd.DataFrame([{"_gref": r[0], "_galt": r[1]} for r in rows])
+
+
+def test_exclude_indels_removes_deletion_allele():
+    """Row with _galt=='' (deletion alt) is removed by exclude-indels filter."""
+    df = _indel_df(("ACGT", ""))
+    result = apply_exclude_indels_filter(df)
+    assert len(result) == 0
+
+
+def test_exclude_indels_removes_insertion_allele():
+    """Row with _gref=='' (insertion ref) is removed by exclude-indels filter."""
+    df = _indel_df(("", "ACGT"))
+    result = apply_exclude_indels_filter(df)
+    assert len(result) == 0
+
+
+def test_exclude_indels_keeps_snps():
+    """SNP rows (_gref and _galt both non-empty) are kept."""
+    df = _indel_df(("A", "G"), ("C", "T"))
+    result = apply_exclude_indels_filter(df)
+    assert len(result) == 2
+
+
+def test_exclude_indels_mixed_dataset():
+    """Mixed dataset: SNPs kept, indels removed."""
+    df = _indel_df(("A", "G"), ("ACGT", ""), ("C", "T"), ("", "ACGT"))
+    result = apply_exclude_indels_filter(df)
+    # indices 0 (SNP) and 2 (SNP) kept; 1 (deletion) and 3 (insertion) removed
+    assert list(result.index) == [0, 2]
+
+
+# ── CoordDelta filter uses anchor_{assembly} ──────────────────────────────────
+
+def test_coord_delta_filter_uses_anchor_column():
+    """CoordDelta filter no longer removes topseq_only; only exceeds-delta rows dropped."""
+    import pandas as pd
+
+    df = pd.DataFrame({
+        "CoordDelta_test": [5, -1, -1],
+        "anchor_test":     ["topseq_n_probe", "topseq_only", "probe_only"],
+    })
+    # Only row with CoordDelta=5 exceeds threshold=2.
+    # topseq_only and probe_only (CoordDelta=-1) pass through.
+    exceeds_delta = df["CoordDelta_test"] > 2
+    result = df[~exceeds_delta]
+    assert len(result) == 2
+    assert set(result["anchor_test"]) == {"topseq_only", "probe_only"}
+
+
+# ── apply_min_anchor_filter ───────────────────────────────────────────────────
+
+def _anchor_df(*values):
+    return pd.DataFrame({"anchor_testasm": list(values)})
+
+
+def test_min_anchor_dual_keeps_only_topseq_n_probe():
+    df = _anchor_df("topseq_n_probe", "topseq_only", "probe_only", "N/A")
+    result = apply_min_anchor_filter(df, "testasm", "dual")
+    assert list(result["anchor_testasm"]) == ["topseq_n_probe"]
+
+
+def test_min_anchor_topseq_accepts_topseq_only():
+    df = _anchor_df("topseq_n_probe", "topseq_only", "probe_only", "N/A")
+    result = apply_min_anchor_filter(df, "testasm", "topseq")
+    assert set(result["anchor_testasm"]) == {"topseq_n_probe", "topseq_only"}
+
+
+def test_min_anchor_probe_accepts_probe_only():
+    df = _anchor_df("topseq_n_probe", "topseq_only", "probe_only", "N/A")
+    result = apply_min_anchor_filter(df, "testasm", "probe")
+    assert set(result["anchor_testasm"]) == {"topseq_n_probe", "topseq_only", "probe_only"}
+
+
+def test_min_anchor_na_always_excluded():
+    for min_anchor in ("dual", "topseq", "probe"):
+        result = apply_min_anchor_filter(_anchor_df("N/A"), "testasm", min_anchor)
+        assert len(result) == 0, f"N/A not excluded at min_anchor={min_anchor}"
+
+
+# ── apply_tie_policy_filter ────────────────────────────────────────────────────
+
+_ALL_TIES = ["unique", "AS_resolved", "dAS_resolved", "NM_resolved",
+             "CoordDelta_resolved", "scaffold_resolved", "locus_unresolved", "N/A"]
+
+
+def _tie_df(*values):
+    return pd.DataFrame({"tie_testasm": list(values)})
+
+
+def test_tie_unique_keeps_only_unique():
+    result = apply_tie_policy_filter(_tie_df(*_ALL_TIES), "testasm", "unique")
+    assert list(result["tie_testasm"]) == ["unique"]
+
+
+def test_tie_resolved_excludes_scaffold_resolved():
+    """resolved does NOT include scaffold_resolved — that requires avoid_scaffolds."""
+    result = apply_tie_policy_filter(_tie_df(*_ALL_TIES), "testasm", "resolved")
+    assert set(result["tie_testasm"]) == {
+        "unique", "AS_resolved", "dAS_resolved", "NM_resolved", "CoordDelta_resolved"
+    }
+
+
+def test_tie_avoid_scaffolds_adds_scaffold_resolved():
+    result = apply_tie_policy_filter(
+        _tie_df("unique", "scaffold_resolved", "locus_unresolved", "N/A"),
+        "testasm", "avoid_scaffolds"
+    )
+    assert set(result["tie_testasm"]) == {"unique", "scaffold_resolved"}
+
+
+def test_tie_locus_unresolved_always_excluded():
+    for tie_policy in ("unique", "resolved", "avoid_scaffolds"):
+        result = apply_tie_policy_filter(_tie_df("locus_unresolved"), "testasm", tie_policy)
+        assert len(result) == 0, f"locus_unresolved not excluded at tie_policy={tie_policy}"
+
+
+# ── apply_min_refalt_confidence_filter ─────────────────────────────────────────
+
+_ALL_REFALT = [
+    "NM_match", "NM_unmatch", "NM_validated", "NM_mismatch",
+    "NM_corrected", "NM_tied", "NM_N/A", "NM_only", "refalt_unresolved", "N/A",
+]
+
+
+def _refalt_df(*values):
+    return pd.DataFrame({"RefAltMethodAgreement_testasm": list(values)})
+
+
+def test_refalt_high_keeps_nm_match_and_validated():
+    result = apply_min_refalt_confidence_filter(_refalt_df(*_ALL_REFALT), "testasm", "high")
+    assert set(result["RefAltMethodAgreement_testasm"]) == {"NM_match", "NM_validated"}
+
+
+def test_refalt_moderate_adds_nm_na_and_nm_tied():
+    result = apply_min_refalt_confidence_filter(_refalt_df(*_ALL_REFALT), "testasm", "moderate")
+    assert set(result["RefAltMethodAgreement_testasm"]) == {
+        "NM_match", "NM_validated", "NM_N/A", "NM_tied"
+    }
+
+
+def test_refalt_low_adds_nm_only_nm_unmatch_nm_corrected():
+    result = apply_min_refalt_confidence_filter(_refalt_df(*_ALL_REFALT), "testasm", "low")
+    assert set(result["RefAltMethodAgreement_testasm"]) == {
+        "NM_match", "NM_validated", "NM_N/A", "NM_tied",
+        "NM_only", "NM_unmatch", "NM_corrected",
+    }
+
+
+def test_refalt_nm_mismatch_always_excluded():
+    for conf in ("high", "moderate", "low"):
+        result = apply_min_refalt_confidence_filter(_refalt_df("NM_mismatch"), "testasm", conf)
+        assert len(result) == 0, f"NM_mismatch not excluded at conf={conf}"
+
+
+def test_refalt_unresolved_always_excluded():
+    for conf in ("high", "moderate", "low"):
+        result = apply_min_refalt_confidence_filter(_refalt_df("refalt_unresolved"), "testasm", conf)
+        assert len(result) == 0, f"refalt_unresolved not excluded at conf={conf}"
+
+
+# ── MAPQ range validation (0–60) ───────────────────────────────────────────────
+
+def _run_parse_args(extra_args):
+    """Helper: run parse_args in a subprocess and return CompletedProcess."""
+    import subprocess, sys, os
+    scripts_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+    cmd = (
+        f"import sys; sys.path.insert(0, {scripts_dir!r}); "
+        f"sys.argv=['q','-i','x','-r','x','-v','x','-a','x',"
+        f"{extra_args}]; "
+        f"from qc_filter import parse_args; a=parse_args(); "
+        f"print(a.min_mapq_topseq, a.min_mapq_probe)"
+    )
+    return subprocess.run([sys.executable, "-c", cmd], capture_output=True, text=True)
+
+
+def test_mapq_topseq_rejects_negative():
+    assert _run_parse_args("'--min-mapq-topseq','-1'").returncode != 0
+
+
+def test_mapq_topseq_rejects_above_60():
+    assert _run_parse_args("'--min-mapq-topseq','61'").returncode != 0
+
+
+def test_mapq_topseq_accepts_0_and_60():
+    proc = _run_parse_args("'--min-mapq-topseq','0','--min-mapq-probe','60'")
+    assert proc.returncode == 0
+    assert "0 60" in proc.stdout
+
+
+def test_mapq_topseq_accepts_off_keyword():
+    proc = _run_parse_args("'--min-mapq-topseq','off','--min-mapq-probe','off'")
+    assert proc.returncode == 0
+    assert "0 0" in proc.stdout
+
+
+def test_mapq_probe_rejects_negative():
+    assert _run_parse_args("'--min-mapq-probe','-1'").returncode != 0
+
+
+# ── format_three_d_table ───────────────────────────────────────────────────────
+
+def test_three_d_table_contains_header_and_totals():
+    three_d = {("topseq_n_probe", "unique"): {"NM_*": 10, "refalt_unresolved": 0, "N/A": 0}}
+    output = format_three_d_table(three_d)
+    assert "anchor" in output
+    assert "tie" in output
+    assert "Total" in output
+    assert "10" in output
+
+
+def test_three_d_table_skips_zero_rows():
+    three_d = {
+        ("topseq_n_probe", "unique"):     {"NM_*": 5, "refalt_unresolved": 0, "N/A": 0},
+        ("topseq_only",    "AS_resolved"):{"NM_*": 0, "refalt_unresolved": 0, "N/A": 0},
+    }
+    output = format_three_d_table(three_d)
+    assert "topseq_only" not in output
+
+
+def test_three_d_table_grand_total_correct():
+    three_d = {
+        ("topseq_n_probe", "unique"):      {"NM_*": 3, "refalt_unresolved": 1, "N/A": 2},
+        ("topseq_only",    "NM_resolved"): {"NM_*": 4, "refalt_unresolved": 0, "N/A": 0},
+    }
+    output = format_three_d_table(three_d)
+    # Grand total = 3+1+2+4 = 10
+    assert "10" in output

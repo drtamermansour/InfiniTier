@@ -1,232 +1,157 @@
-# CLAUDE.md — Developer Context for Array Manifest Remapper
+# CLAUDE.md — Developer Quick Reference
 
-This file provides context for AI assistants (Claude Code) and human contributors working on this repository. Read it before making any changes.
+Compact orientation for future Claude Code sessions. User-facing docs live in
+`README.md` and `docs/`; this file is for fast retrieval of invariants,
+pitfalls, file paths, and test commands.
 
----
+## What this is
 
-## Project Purpose
+Pipeline that remaps Illumina genotyping arrays between reference assemblies.
+Built for **Equine80select v1 (EquCab2) → EquCab3** (~82 k SNPs).
 
-This pipeline remaps Illumina genotyping array manifests from one reference genome assembly to another. The primary use case is remapping the **Equine80select** array (~82k SNP markers) from **EquCab2** to **EquCab3**. The core challenge is that simple coordinate lifting fails in repetitive regions and inverted loci, so a dual-alignment approach is used instead.
+Headline output: `qc/{prefix}_allele_map_{assembly}.tsv`
+(8-column headered TSV — see `docs/output_formats.md`).
 
-**The main output used in downstream analysis** is:
-```
-matchingSNPs_binary_consistantMapping.{assembly}_map
-```
-This tab-delimited file maps ~80,197 high-quality markers and is consumed directly by GWAS/imputation pipelines (e.g., PLINK2, Beagle).
-
----
-
-## Architecture
+## File map
 
 ```
-install.sh
-    └── Creates conda env 'remap' (minimap2, samtools, bcftools, pysam, pandas)
+run_pipeline.sh                    orchestrator: faidx → remap_manifest.py → qc_filter.py
+submit_slurm.sh                    SLURM wrapper
+install.sh                         conda env 'remap' (minimap2, samtools, bcftools, pysam, pandas)
+myRun.sh                           historical record of the v1→equCab3 invocation
 
-run_pipeline.sh                          ← main entry point (bash, arg-parsed)
-    ├── samtools faidx + vcf_contigs.txt ← reference prep (step 1)
-    ├── scripts/remap_manifest.py        ← dual alignment + coordinate resolution (step 2)
-    └── scripts/qc_filter.py            ← QC cascade + all output generation (step 3)
+scripts/_strand_utils.py           strand_normalize(allele, strand) + complement(seq)
+scripts/remap_manifest.py          dual alignment + 3-dim output
+scripts/qc_filter.py               11-stage QC cascade + WhyFiltered trace
+scripts/benchmark_compare.py       ground-truth benchmark + verdict + QC impact
+scripts/benchmark_cigar_vs_probe.py  3-way coord comparison (probe_cigar / topseq_cigar / final)
+scripts/scaffold_haplotype_*.py    pre-pipeline alt-haplotype removal
+scripts/exclude_alt_haplotypes.py  builds cleaned FASTA
 
-scripts/compare_molly.sh                 ← optional standalone cross-validation
-submit_slurm.sh                          ← SLURM wrapper for HPC
+tests/                             pytest; conftest takes --results-dir for integration
+docs/                              user-facing guides; *_simple.md is the source mermaid
 ```
 
----
+## 3-dimension output framework (single source of truth)
 
-## Module Details
+Every marker gets exactly three orthogonal columns (after `-a equCab3`):
 
-### `scripts/remap_manifest.py`
+- `anchor_equCab3` ∈ {`topseq_n_probe`, `topseq_only`, `probe_only`, `N/A`}
+- `tie_equCab3` ∈ {`unique`, `AS_resolved`, `dAS_resolved`, `NM_resolved`,
+  `CoordDelta_resolved`, `scaffold_resolved`, `locus_unresolved`, `N/A`}
+- `RefAltMethodAgreement_equCab3` ∈ {`NM_match`, `NM_validated`, `NM_N/A`,
+  `NM_tied`, `NM_only`, `NM_unmatch`, `NM_corrected`, `NM_mismatch`,
+  `refalt_unresolved`, `N/A`}
 
-**Input:** Illumina manifest CSV, reference FASTA
-**Output:** Remapped manifest CSV with 7 new columns (see below)
+**Chr=0 rule:** marker is excluded from downstream iff `anchor=N/A` OR
+`tie=locus_unresolved` OR `RefAltMethodAgreement=refalt_unresolved` (or
+`NM_mismatch` for indels via Stage 2 of QC).
 
-Key steps:
-1. Parses the `[Assay]` section of the Illumina manifest (skipping header/footer)
-2. Builds two FASTA files: `temp_probes.fasta` (50bp AlleleA probes) and `temp_topseq.fasta` (two sequences per marker: `PREFIX+AlleleA+SUFFIX` and `PREFIX+AlleleB+SUFFIX`)
-3. Runs `minimap2 -ax sr` on both — `-N 5` for probes to allow secondary alignments for overlap checking
-4. Parses TopGenomicSeq SAM: lower NM (edit distance) candidate = reference allele
-5. Selects best probe alignment by overlap with TopGenomicSeq window, MAPQ as tiebreaker
-6. Calculates variant position via `get_probe_coordinate()` (probe-based, primary) or `parse_cigar_to_ref_pos()` (TopSeq CIGAR fallback)
+## QC cascade (11 stages, all configurable)
 
-**CLI flags:** `-i`, `-r`, `-o`, `-a` (assembly name), `--threads`, `--temp-dir`, `--keep-temp`, `--resume`
+In `qc_filter.py:WHY_FILTERED_LABELS`. Order matters because `WhyFiltered`
+records the **first** rejection per marker:
 
-### `scripts/qc_filter.py`
+1. `stage_1_failed_markers` — `Strand=N/A` (always on)
+2. `stage_2_design_conflict` — Ref ≠ genome ref / `NM_mismatch` (always on)
+3. `stage_3_min_anchor` — `--min-anchor` (`dual`/`topseq`/`probe`)
+4. `stage_4_tie_policy` — `--tie-policy` (`unique`/`resolved`/`avoid_scaffolds`)
+5. `stage_5_min_refalt_confidence` — `--min-refalt-confidence` (`high`/`moderate`/`low`)
+6. `stage_6_mapq_topseq` — `--min-mapq-topseq 30` (probe_only NaN-exempt; pass `off` to disable)
+7. `stage_7_mapq_probe` — `--min-mapq-probe off` default (topseq_only NaN-exempt)
+8. `stage_8_coord_delta` — `--max-coord-delta off` default
+9. `stage_9_indel_excluded` — off by default; `--include-indels` to include
+10. `stage_10_polymorphic` — off by default; `--include-polymorphic` to include
+11. `stage_11_ambiguous_snp` — off by default; `--include-ambiguous-snps` to include
 
-**Input:** Remapped manifest CSV + reference FASTA + vcf_contigs.txt + SAM files (for consistency check)
-**Output:** All filtered VCFs, BIM, final map file, QC_Report.txt, remap_assessment/
+`tie-label resolved` accepts all `*_resolved` **except** `scaffold_resolved`
+(see `_TIE_RESOLVED` in `qc_filter.py`).
 
-Filter stages (in order):
-1. `Strand_{assembly} == 'N/A'` → unmapped, remove
-2. `MAPQ_TopGenomicSeq < --mapq-topseq` → low-confidence mapping, remove
-3. Remapped Ref ≠ genome Ref at that position → design conflict, remove
-4. Multiple Ref/Alt combinations at same Chr:Pos → polymorphic site, remove
-5. Count of (topseq_A + topseq_B + probe) SAM records ≠ 3 → inconsistent, remove
+## Coordinate selection (in `run_remapping`)
 
-Also computes:
-- `allele_usage_decision.txt` (as_is / complement per marker)
-- MAPQ histograms in `remap_assessment/`
-- Known-assembly benchmark (markers where original assembly == target, checks coordinate match)
+Two CIGAR-derived coordinates per `topseq_n_probe` marker:
 
-**CLI flags:** `-i`, `-r`, `-v`, `-a`, `-o`, `--mapq-topseq`, `--mapq-probe`, `--temp-dir`, `--prefix`, `--topseq-sam`, `--probe-sam`
+- `CoordProbe_{a}` — from probe alignment's CIGAR walk.
+- `Coord_TopSeqCIGAR_{a}` — from TopGenomicSeq alignment's CIGAR walk.
+- `CoordDelta_{a}` = `|CoordProbe − Coord_TopSeqCIGAR|`; `−1` if CIGAR unavailable.
+- `CoordSource_{a}` ∈ {`"probe_cigar"`, `"topseq_cigar"`, `"N/A"`} — which
+  one ended up in `MapInfo_{a}`.
 
----
+Rule (applied in order, `run_remapping`):
+1. `cigar_in_sc` (SNP in TopSeq soft clip) → `probe_cigar`.
+2. `is_indel` → `topseq_cigar` (probe isn't precise enough for indels).
+3. `CoordDelta ≥ 2` AND TopSeq CIGAR has an I/D within 5 bp of
+   `target_idx` in query space → `probe_cigar` (gap-placement ambiguity
+   in homopolymer/tandem-repeat contexts; minimap2 left-aligns the gap,
+   the CIGAR walk inherits the shifted coordinate, so defer to the
+   probe-derived coordinate).
+4. `CoordDelta ≥ 2` with clean TopSeq CIGAR → `topseq_cigar`.
+5. Otherwise → `probe_cigar`.
 
-## Key Output Column Names
+One-liner: *a `topseq_n_probe` marker uses `probe_cigar` unless the
+marker is an indel or `CoordDelta ≥ 2` with a clean TopSeq CIGAR, in
+which case it uses `topseq_cigar`.*
 
-The assembly name (from `--assembly` / `-a`) is embedded in column names. For EquCab3:
+Empirical accuracy (pre-rescue): probe_cigar 98.0%, topseq_cigar 98.6%,
+final 98.7%.
 
-| Column | Type | Meaning |
-|---|---|---|
-| `Chr_equCab3` | str | Chromosome on new assembly (`"0"` = unmapped) |
-| `MapInfo_equCab3` | int | 1-based base-pair position |
-| `Strand_equCab3` | str | `+`, `-`, or `N/A` (from TopGenomicSeq alignment) |
-| `Ref_equCab3` | str | Reference allele (from TopGenomicSeq, NOT strand-normalized) |
-| `Alt_equCab3` | str | Alternate allele (same) |
-| `MAPQ_TopGenomicSeq` | int | MAPQ of winning TopGenomicSeq alignment |
-| `MAPQ_Probe` | int | MAPQ of selected probe alignment; **0 = TopSeq fallback used** |
+## Critical invariants & pitfalls
 
-**Important:** `Ref_equCab3` and `Alt_equCab3` are in the **alignment strand** of the TopGenomicSeq winner, not necessarily the forward (+) strand. The `qc_filter.py` strand-normalizes them before VCF/map output using `strand_normalize(allele, strand)`.
+1. **Pipeline-internal code must NOT read `RefStrand`/`SourceStrand`/`IlmnStrand` as ground truth.** They are Illumina-design conventions that don't reliably predict reference-strand orientation. Only `benchmark_compare.py` uses `RefStrand` (as benchmark ground truth). Strand handling inside `remap_manifest.py` is sequence-derived (`probe_topseq_orientation` + 21-mer fallback).
 
----
+2. **`MAPQ_Probe = NaN` ≠ MAPQ was zero.** NaN means `topseq_only` (no probe alignment used). MAPQ filters must do `.notna() & (col < threshold)` — see `apply_probe_mapq_filter`. Same for `MAPQ_TopGenomicSeq = NaN` for `probe_only` markers.
 
-## Key Biological Concepts
+3. **`CoordDelta = -1` is a sentinel**, not a negative distance. `-1` whenever one of the two CIGARs is unavailable: SNP in a soft-clipped TopSeq region, or `topseq_only` (no probe alignment), or `probe_only` (no TopSeq alignment). Stage 8 `--max-coord-delta N` correctly leaves them through (`-1 > N` is false for N ≥ 0). Use the same phrasing in user-facing reports and `output_formats.md`.
 
-### Illumina Manifest Format
-- **`AlleleA_ProbeSeq`**: the 50bp physical probe sequence (Infinium I: two probes; Infinium II: one probe)
-- **`AlleleB_ProbeSeq`**: present for Infinium I (two different probes), absent/NaN for Infinium II
-- **`TopGenomicSeq`**: longer genomic context `PREFIX[AlleleA/AlleleB]SUFFIX` — the square-bracket section is the SNP
-- **`SNP`**: the marker's allele pair in Illumina notation, e.g. `[A/G]`
-- **`IlmnStrand`**, **`SourceStrand`**: describe the relationship between the probe and the reference strand (TOP/BOT or PLUS/MINUS)
+4. **Probe alignment strand ≠ TopSeq alignment strand.** They are independent SAM-FLAG-derived values. Mixing them caused the original ±51 bp bug. `get_probe_coordinate` uses **probe** strand; `parse_cigar_to_ref_pos` uses **TopSeq** strand for `target_idx`.
 
-### Infinium Chemistry
-- **Infinium II**: single probe, extends into the SNP site — variant position is 1 base AFTER the probe's 3' end
-- **Infinium I**: two probes (one per allele), both ending AT the SNP — variant position IS the probe's last base
-- Determined in code by: `pd.isna(row['AlleleB_ProbeSeq'])` → True = Infinium II
+5. **`Ref_{a}` / `Alt_{a}` are stored in the TopSeq alignment-strand orientation.** `qc_filter.py` strand-normalises them to `+` strand for VCF/BIM output via `strand_normalize` from `_strand_utils`.
 
-### Dual-Alignment Strategy
-TopGenomicSeq is the **strand authority** — it determines chromosome, strand, and Ref/Alt. The probe provides **coordinate precision** when it aligns consistently. If probe alignment disagrees with TopGenomicSeq strand or falls on a different chromosome, the coordinate falls back to parsing the TopGenomicSeq CIGAR string.
+6. **Deletion minus-strand correction** in `run_remapping` (after `determine_ref_alt_v2`): when `len(ref) > len(alt)` and TopSeq strand is `-`, subtract `len(ref) - len(alt)` from `final_pos` and `c_pos` if `coord_source == "probe_cigar"`. Don't touch this — it's correct.
 
-### Allele Usage Decision (8-condition XOR logic)
-Controls how manifest SNP alleles (`[A/B]` column) map to forward-strand genomic alleles:
+7. **Resume after step 3 failure** — `bash run_pipeline.sh ... --resume --temp-dir <existing>` skips the multi-hour minimap2 step. Use `--keep-temp` to preserve SAM files first.
 
-```
-flip = (IlmnStrand != SourceStrand) XOR (SourceSeq != TopGenomicSeq) XOR (Strand == '-')
-decision = 'complement' if flip else 'as_is'
-```
+8. **`Chr_{a}` is always a string.** Load with `dtype={col_chr: str}`. Unplaced contigs like `Un_NW_*` are valid values.
 
-Indel markers get the prefix `indel_` (e.g., `indel_as_is`). These are tracked but excluded from VCF output.
+9. **`bcftools` must be on PATH** for `qc_filter.py extract_ref_alleles`. `conda activate remap` provides it.
 
----
+10. **`-a / --assembly` is required** in `run_pipeline.sh` (no FASTA-derived default — column names embed the assembly label and a wrong derivation propagates silently).
 
-## Final Map File Format
-
-`matchingSNPs_binary_consistantMapping.{assembly}_map` — tab-delimited, no header, 8 columns:
-
-```
-chr  pos  snpID  SNP_alleles  genomic_alleles  SNP_ref_allele  genomic_ref_allele  decision
-```
-
-- `SNP_alleles`: allele pair from manifest `[A/B]` column, comma-separated (e.g., `A,G`)
-- `genomic_alleles`: forward-strand alleles in the **same order** as SNP_alleles (e.g., `G,A` means SNP allele A ↔ genomic G)
-- `SNP_ref_allele`: the manifest allele corresponding to the genomic reference
-- `genomic_ref_allele`: the reference allele on the forward strand
-- `decision`: `as_is` or `complement` (or `indel_*` variant)
-
----
-
-## Common Pitfalls for Contributors
-
-1. **Column names depend on `--assembly` flag.** If you pass `-a equCab3`, columns are `Chr_equCab3`. If you pass `-a EquCab3`, they are `Chr_EquCab3`. These must match between `remap_manifest.py` and `qc_filter.py` — `run_pipeline.sh` handles this automatically.
-
-2. **Resume after step 3 failure.** If `qc_filter.py` fails after `remap_manifest.py` has already completed, re-run with `--resume` to skip the expensive minimap2 alignment step. Temp files (including SAM files) are never deleted until the full pipeline completes successfully, so `--resume` always has access to the SAM files needed for the consistency filter — no special flags required on the original run.
-
-3. **Consistency check requires SAM files.** `qc_filter.py` needs `temp_topseq.sam` and `temp_probe.sam` for the consistency filter (step 5). When run via `run_pipeline.sh`, these files always exist at step 3 (they are only deleted at the very end of a successful run). If calling `qc_filter.py` directly on the output of an already-completed pipeline (where temp files were already cleaned up), pass `--topseq-sam` and `--probe-sam` explicitly, or the consistency filter is skipped with a warning.
-
-4. **bcftools must be on PATH.** `qc_filter.py` calls `bcftools norm` as a subprocess. Activating the `remap` conda environment provides this.
-
-5. **minimap2 `-ax sr` mode** is designed for short genomic reads (~50–300 bp). Both probes (~50 bp) and TopGenomicSeq (~150 bp) fall in this range.
-
-6. **The `Chr` column in the remapped CSV is a string**, not an integer — chromosomes like `Un_NW_*` are valid. Always use `dtype={col_chr: str}` when loading.
-
-7. **Deletion correction on minus strand.** When a marker is a deletion (len(Ref) > len(Alt)) and the strand is `-`, `remap_manifest.py` subtracts `del_len` from the raw probe coordinate. Do not remove this logic — it reflects the directional asymmetry of probe 3' end positioning.
-
----
-
-## How to Run (Equine80select → EquCab3)
+## Tests
 
 ```bash
 conda activate remap
-
-bash run_pipeline.sh \
-    -i backup_original/Equine80select_24_20067593_B1.csv \
-    -r equCab3/equCab3_genome.fa \
-    -a equCab3 \
-    -o results/ \
-    -t 8
+pytest tests/ -v                                         # unit tests (~9 s)
+pytest tests/test_benchmark_compare.py --results-dir <dir> -v   # +3 integration
 ```
 
-Expected: ~80,197 markers in `results/matchingSNPs_binary_consistantMapping.equCab3_map`
+When adding production code, mirror the existing TDD pattern (RED → GREEN
+in `tests/test_<module>.py`). Tests use `_strand_utils.strand_normalize`
+directly via `scripts/` import (see `tests/conftest.py` for the `sys.path`
+manipulation).
 
----
+## Common dev tasks
 
-## How to Add a New Assembly
+- **Adding a QC filter stage** — extend `WHY_FILTERED_LABELS` (in order),
+  add the helper function (mirror `apply_exclude_indels_filter`), wire into
+  `run_qc` after the previous `_tag_removed` call, add CLI flag in
+  `parse_args`, plumb through `run_pipeline.sh`, add row to README's
+  cascade table and the `docs/qc_filters.md` table.
 
-No code changes are needed. Just:
+- **Adding a benchmark verdict** — add the rule in
+  `benchmark_compare.classify_explanatory`, update the verdict table in
+  `docs/benchmarking.md`, add a unit test in `tests/test_benchmark_compare.py`.
 
-1. Download the target assembly FASTA
-2. Strip `chr` prefix if present: `sed 's/>chr/>/' raw.fa > assembly.fa`
-3. Index it: `samtools faidx assembly.fa`
-4. Run the pipeline with the new `-r` and `-a` values:
-   ```bash
-   bash run_pipeline.sh -i manifest.csv -r /path/to/assembly.fa -a assemblyName -o results/
-   ```
+- **Touching strand normalisation** — update only `scripts/_strand_utils.py`.
+  All consumers (`remap_manifest.py`, `qc_filter.py`, `benchmark_compare.py`)
+  import from it. Don't reintroduce a hand-rolled `_RC_TABLE` or
+  `COMPLEMENT` dict in any consumer.
 
-Output column names and file names will use your `assemblyName` automatically.
+## Things to ignore
 
----
-
-## File Inventory
-
-### Scripts (production)
-| File | Purpose |
-|---|---|
-| `install.sh` | One-time conda environment setup |
-| `run_pipeline.sh` | Main orchestrator (arg-parsed, calls both Python scripts) |
-| `submit_slurm.sh` | SLURM wrapper for HPC submission |
-| `myRun.sh` | Project-specific SLURM run script for Equine80select → EquCab3; records the exact flags used (`--assembly equCab3 --threads 64 --keep-temp --resume --mapq-topseq 1`) |
-| `scripts/remap_manifest.py` | Core remapping: dual alignment + coordinate resolution |
-| `scripts/qc_filter.py` | QC cascade, allele decision, VCF/BIM/map generation |
-| `scripts/scaffold_haplotype_analyzer.py` | Pre-pipeline: align all unplaced scaffolds to chromosomal reference. |
-| `scripts/filter_scaffold_haplotypes.py` | Pre-pipeline: filter the aligned unplaced scaffolds, output `scaffold_haplotype_analysis/alt_haplotype_candidates.tsv` |
-| `scripts/compare_molly.sh` | Optional: cross-validation vs. MNEc670k dataset |
-
-### Reference data
-| File/Dir | Purpose |
-|---|---|
-| `equCab3/equCab3_genome.fa` | EquCab3 reference genome FASTA |
-| `equCab3/equCab3_genome.fa.fai` | samtools index |
-| `equCab3/vcf_contigs.txt` | VCF header contig definitions (generated by pipeline) |
-| `equCab2/equCab2_genome.fa` | EquCab2 reference (symlink; needed for EquCab2 benchmarking) |
-| `backup_original/` | Original Illumina manifest CSV (do not modify) |
-
-### Generated outputs of remapping (from completed Equine80selectv1 → EquCab3 run)
-| File | Description |
-|---|---|
-| `Equine80select_24_20067593_B1_remapped.csv` | Remapped manifest (all markers) |
-| `matchingSNPs_binary_consistantMapping.EquCab3_map` | **Main output** (80,197 markers) |
-| `Equine80select_remapped_equCab3.bim` | PLINK BIM (80,223 markers) |
-| `_matchingSNPs_binary_consistantMapping.vcf` | Final VCF |
-| `allele_usage_decision.txt` | Allele orientation decisions |
-| `MNEc670k_remap.tab` | Molly dataset (cleaned tab form) |
-| `molly_remapped_*.txt` | Cross-validation results |
-| `remap_assessment/` | MAPQ histograms, benchmark mismatches |
-| `inconsistent_remapped.csv` | Markers excluded by consistency filter |
-| `polymorphic_positions.txt` | Positions excluded by polymorphic filter |
-| `temp_probes.fasta`, `temp_topseq.fasta` | Alignment input sequences (kept for debugging) |
-| `temp_probe.sam`, `temp_topseq.sam` | Alignment outputs (needed for consistency check) |
-| `_tmp.*` | Intermediate allele tables (generated by pipeline) |
-
-### Scratch / archive (ignore)
-| File/Dir | Purpose |
-|---|---|
-| `temp/` | Archive folder — not part of the pipeline. Contains `master_pipeline.sh` (superseded by `run_pipeline.sh`) and two troubleshooting script fragments (`tmp_benchmark.sh`, `tmp_test_remapping.sh`). **Ignore for development.** |
+- `temp/` and `ignore/` — historical scripts and superseded plans.
+- Any file under `ignore/superpowers/` — past brainstorm/plan artifacts.
+- `my-session.txt` — historical session log.
+- Any user-chosen input directory for Illumina manifests (historically
+  `backup_original/`, now `manifests/` in this checkout) — treat as read-only
+  user inputs; the path is whatever `-i` the user passed to `run_pipeline.sh`.
